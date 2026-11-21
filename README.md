@@ -62,12 +62,12 @@ Run `awake` without arguments in any terminal (or with `awake -t 2h`) to launch 
 Run this command in Terminal (admin password needed **once**):
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/TITANHACKY/macawake/main/install.sh)"
+/bin/bash -c "$(curl --connect-timeout 2 -fsSL https://raw.githubusercontent.com/TITANHACKY/macawake/main/install.sh)"
 ```
 
 Or piped via curl:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TITANHACKY/macawake/main/install.sh | bash
+curl --connect-timeout 2 -fsSL https://raw.githubusercontent.com/TITANHACKY/macawake/main/install.sh | bash
 ```
 
 Or clone and install locally:
