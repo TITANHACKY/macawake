@@ -14,12 +14,6 @@
 
 set -euo pipefail
 
-# If standard input is a pipe (e.g. curl ... | bash), reconnect stdin to /dev/tty
-# so sudo and interactive terminal prompts can read user input without SIGTTIN suspension.
-if [ ! -t 0 ] && [ -r /dev/tty ]; then
-  exec < /dev/tty
-fi
-
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/TITANHACKY/macawake/main}"
 
 # ANSI Colors & Styles
