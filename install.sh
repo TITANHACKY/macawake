@@ -92,23 +92,16 @@ echo
 
 # ---- Step 3: Admin Authentication & LaunchDaemon Setup ----
 printf "  ${C_BOLD}[3/4] 🔐 Installing LaunchDaemon root service...${C_RESET}\n"
+printf "  ${C_DIM}Admin password is required ONCE to install the background service.${C_RESET}\n"
+printf "  ${C_DIM}You will NEVER need admin or a password for daily usage.${C_RESET}\n\n"
 
-# Authenticate upfront if sudo session is not already cached
-if ! sudo -n true 2>/dev/null; then
-  printf "  ${C_YELLOW}┌─────────────────────────────────────────────────────────────┐${C_RESET}\n"
-  printf "  ${C_YELLOW}│${C_RESET}  ${C_BOLD}🔑 Administrator authentication required (ONCE ONLY)${C_RESET}        ${C_YELLOW}│${C_RESET}\n"
-  printf "  ${C_YELLOW}│${C_RESET}  ${C_DIM}MacAwake needs admin once to install its background daemon.${C_RESET} ${C_YELLOW}│${C_RESET}\n"
-  printf "  ${C_YELLOW}│${C_RESET}  ${C_DIM}You will NEVER need admin or a password for daily use.${C_RESET}       ${C_YELLOW}│${C_RESET}\n"
-  printf "  ${C_YELLOW}└─────────────────────────────────────────────────────────────┘${C_RESET}\n\n"
-  sudo -v || { err "Authentication failed."; exit 1; }
-  echo
-fi
+# Ensure cursor is visible for password prompt
+printf '\033[?25h'
 
-printf "  ${C_CYAN}⠋${C_RESET} Registering LaunchDaemon & setting permissions...\r"
 if sudo bash "$SOURCE_SCRIPT" --install "$TARGET_USER" --quiet; then
-  printf "\r  ${C_GREEN}✓${C_RESET} LaunchDaemon registered and running            \n"
+  printf "  ${C_GREEN}✓ LaunchDaemon registered and running${C_RESET}\n"
 else
-  printf "\r  ${C_RED}✗${C_RESET} Installation failed during LaunchDaemon setup. \n"
+  printf "  ${C_RED}✗ Installation failed during LaunchDaemon setup.${C_RESET}\n"
   exit 1
 fi
 echo

@@ -597,9 +597,8 @@ EOF
   write_guard
   write_plist
   if command -v launchctl >/dev/null 2>&1; then
-    launchctl bootstrap system "$PLIST" 2>/dev/null \
-      || launchctl load -w "$PLIST" 2>/dev/null
-    launchctl kickstart -k "system/$DLABEL" 2>/dev/null
+    launchctl bootout "system/$DLABEL" 2>/dev/null || launchctl unload -w "$PLIST" 2>/dev/null || true
+    launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST" 2>/dev/null || true
   fi
   "${AWAKE_PMSET:-/usr/bin/pmset}" -a disablesleep 0 2>/dev/null
 
