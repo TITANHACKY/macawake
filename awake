@@ -564,7 +564,15 @@ PLIST
 
 install_awake() {
   [ "$(id -u)" -eq 0 ] || { echo "Setup needs admin. Run:  sudo awake --install"; exit 1; }
-  local user="${1:-$SUDO_USER}"
+  local quiet=0
+  local user=""
+  for arg in "$@"; do
+    case "$arg" in
+      --quiet|-q) quiet=1 ;;
+      *) [ -z "$user" ] && user="$arg" ;;
+    esac
+  done
+  [ -z "$user" ] && user="$SUDO_USER"
   if [ -z "$user" ] || [ "$user" = root ] || ! id "$user" >/dev/null 2>&1; then
     echo "Couldn't tell which account will use awake."
     echo "Run:  sudo awake --install <your-username>"
@@ -594,12 +602,15 @@ EOF
     launchctl kickstart -k "system/$DLABEL" 2>/dev/null
   fi
   "${AWAKE_PMSET:-/usr/bin/pmset}" -a disablesleep 0 2>/dev/null
-  echo "Installed successfully! The root background service is running and sleep is normal."
-  echo "Daily use needs no admin or password. Try:"
-  echo "    awake            # Launch live Trading Terminal"
-  echo "    awake -t 1h      # Timed session"
-  echo "    awake -b 25      # Set battery cutoff to 25% (default: 30%)"
-  echo "    awake --help     # Full options & cheatsheet"
+
+  if [ "$quiet" -eq 0 ]; then
+    echo "Installed successfully! The root background service is running and sleep is normal."
+    echo "Daily use needs no admin or password. Try:"
+    echo "    awake            # Launch live Trading Terminal"
+    echo "    awake -t 1h      # Timed session"
+    echo "    awake -b 25      # Set battery cutoff to 25% (default: 30%)"
+    echo "    awake --help     # Full options & cheatsheet"
+  fi
   exit 0
 }
 
