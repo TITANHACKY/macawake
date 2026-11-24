@@ -4,11 +4,11 @@
 # Designed for MDM-managed Macs that grant admin for only a few minutes.
 # Admin is needed ONCE, for setup. After that, no admin or password is needed.
 #
-# Version: 1.1.0
+# Version: 1.2.0
 
 set -f
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 R="${AWAKE_TEST_ROOT:-}"
 SUPPORT="$R/Library/Application Support/awake"
 SESSIONS="$SUPPORT/sessions"
@@ -51,10 +51,12 @@ load_config() {
   BATT_GUARD=$DEFAULT_BATT_GUARD
   BATT_THRESHOLD=$DEFAULT_BATT_THRESHOLD
   local target=""
-  if [ -f "$CONFIG" ]; then
-    target="$CONFIG"
-  elif [ -f "$USER_CONFIG" ]; then
+  # A user config is authoritative when the shared config is read-only or was
+  # created by an earlier install that could not update it.
+  if [ -f "$USER_CONFIG" ]; then
     target="$USER_CONFIG"
+  elif [ -f "$CONFIG" ]; then
+    target="$CONFIG"
   fi
   if [ -n "$target" ]; then
     local val_en val_th
@@ -69,14 +71,23 @@ load_config() {
 
 save_config() {
   local target="$CONFIG"
-  if [ ! -w "$(dirname "$CONFIG")" ] && [ ! -w "$CONFIG" ]; then
+  local config_dir
+  config_dir=$(dirname "$CONFIG")
+  if { [ -f "$CONFIG" ] && [ ! -w "$CONFIG" ]; } || { [ ! -e "$CONFIG" ] && [ ! -w "$config_dir" ]; }; then
     target="$USER_CONFIG"
   fi
-  mkdir -p "$(dirname "$target")" 2>/dev/null || true
-  cat > "$target" << EOF
-BATTERY_GUARD_ENABLED=$BATT_GUARD
-BATTERY_GUARD_THRESHOLD=$BATT_THRESHOLD
-EOF
+  mkdir -p "$(dirname "$target")" 2>/dev/null || return 1
+  local tmp="${target}.tmp.$$"
+  if ! printf 'BATTERY_GUARD_ENABLED=%s\nBATTERY_GUARD_THRESHOLD=%s\n' "$BATT_GUARD" "$BATT_THRESHOLD" > "$tmp"; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! mv -f "$tmp" "$target" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  chmod 644 "$target" 2>/dev/null || true
+  return 0
 }
 
 show_battery_pref() {
@@ -94,12 +105,12 @@ set_battery_pref() {
   val=$(echo "$val" | tr -d '% ')
   if [ "$val" = "off" ] || [ "$val" = "disable" ] || [ "$val" = "0" ]; then
     BATT_GUARD=0
-    save_config
+    save_config || { echo "Unable to save the battery guard preference." >&2; exit 1; }
     echo "Battery Guard preference updated: DISABLED"
   elif [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 100 ]; then
     BATT_GUARD=1
     BATT_THRESHOLD="$val"
-    save_config
+    save_config || { echo "Unable to save the battery guard preference." >&2; exit 1; }
     echo "Battery Guard preference updated: ENABLED (${BATT_THRESHOLD}%)"
     echo "Mac will automatically restore normal sleep if battery drops <= ${BATT_THRESHOLD}%."
   else
@@ -115,14 +126,24 @@ sleep_is_disabled() {
 }
 
 request_set() {
-  printf '%s\n' "$1" > "$REQUEST" 2>/dev/null || true
+  local tmp="${REQUEST}.tmp.$$"
+  if printf '%s\n' "$1" > "$tmp" 2>/dev/null && mv -f "$tmp" "$REQUEST" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
 }
 
 session_set() {
   local state="$1" pid="$2" until="${3:-0}"
-  mkdir -p "$SESSIONS" 2>/dev/null || true
+  mkdir -p "$SESSIONS" 2>/dev/null || return 1
   SESSION_FILE="$SESSIONS/$pid.session"
-  printf 'state=%s pid=%s uid=%s until=%s started=%s\n' "$state" "$pid" "$UID" "$until" "$(date +%s)" > "$SESSION_FILE" 2>/dev/null || true
+  local tmp
+  tmp=$(mktemp "$SESSIONS/.session.XXXXXX" 2>/dev/null) || return 1
+  if ! printf 'state=%s pid=%s uid=%s until=%s started=%s\n' "$state" "$pid" "$UID" "$until" "$(date +%s)" > "$tmp" 2>/dev/null || ! mv -f "$tmp" "$SESSION_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
 
   # Legacy compatibility request file update
   if [ "$state" = "on" ]; then
@@ -141,7 +162,9 @@ session_remove() {
   [ -n "$pid" ] && rm -f "$SESSIONS/$pid.session" 2>/dev/null || true
   local count=0
   if [ -d "$SESSIONS" ]; then
-    count=$(ls -1 "$SESSIONS"/*.session 2>/dev/null | wc -l | tr -d ' ')
+    for sf in "$SESSIONS"/*.session; do
+      [ -e "$sf" ] && count=$((count + 1))
+    done
   fi
   if [ "$count" -eq 0 ]; then
     request_set "off"
@@ -186,7 +209,7 @@ handle_poll_failure() {
       printf "${C_YELLOW}⚠️  MacAwake Battery Guard active:${C_RESET} Sleep prevention was blocked.\n"
       printf "   Battery is at ${C_BOLD}%s%%${C_RESET} (cutoff is %s%%).\n" "$BATT_PCT" "$BATT_THRESHOLD"
       printf "   Plug into power or change cutoff: ${C_CYAN}awake -b off${C_RESET} or ${C_CYAN}awake -b %s${C_RESET}\n" "$(( BATT_PCT > 10 ? BATT_PCT - 5 : 5 ))"
-    elif ! launchctl print "system/$DLABEL" >/dev/null 2>&1 && ! launchctl list 2>/dev/null | grep -q "$DLABEL"; then
+    elif ! daemon_loaded; then
       echo "The background service isn't loaded in launchd."
       echo "Run once during an admin window:  sudo awake --install"
     else
@@ -194,6 +217,11 @@ handle_poll_failure() {
       echo "Run diagnostics:  awake doctor"
     fi
   fi
+}
+
+daemon_loaded() {
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl print "system/$DLABEL" >/dev/null 2>&1 || launchctl list 2>/dev/null | grep -q "$DLABEL"
 }
 
 not_set_up() {
@@ -346,7 +374,7 @@ show_status() {
   fi
 
   if command -v launchctl >/dev/null 2>&1; then
-    if launchctl print "system/$DLABEL" >/dev/null 2>&1 || launchctl list 2>/dev/null | grep -q "$DLABEL"; then
+    if daemon_loaded; then
       echo "  Background Guard : Active (com.awake.guard loaded in launchd)"
     else
       echo "  Background Guard : Not loaded (run: sudo awake --install)"
@@ -356,17 +384,17 @@ show_status() {
   echo "  Active Sessions  :"
   local count=0
   if [ -d "$SESSIONS" ]; then
-    local now=$(date +%s)
+    local now
+    now=$(date +%s)
     for sf in "$SESSIONS"/*.session; do
       [ -e "$sf" ] || continue
-      local spid="" suid="" suntil=0 sstate="on" sstarted=0
+      local spid="" suid="" suntil=0 sstate="on"
       for kv in $(cat "$sf" 2>/dev/null); do
         case "$kv" in
           pid=*) spid="${kv#pid=}" ;;
           uid=*) suid="${kv#uid=}" ;;
           until=*) suntil="${kv#until=}" ;;
           state=*) sstate="${kv#state=}" ;;
-          started=*) sstarted="${kv#started=}" ;;
         esac
       done
       if [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null; then
@@ -407,7 +435,7 @@ run_doctor() {
   fi
 
   if command -v launchctl >/dev/null 2>&1; then
-    if launchctl print "system/$DLABEL" >/dev/null 2>&1 || launchctl list 2>/dev/null | grep -q "$DLABEL"; then
+    if daemon_loaded; then
       echo "  [✓] LaunchDaemon service: $DLABEL is active"
     else
       echo "  [!] LaunchDaemon service: $DLABEL is not running in launchd"
@@ -475,14 +503,22 @@ write_guard() {
   mkdir -p "$LIBEXEC"
   cat > "$GUARD_BIN" << 'GUARD'
 #!/bin/bash
-# Runs as root via launchd. Reads session files / request file and applies desired sleep state.
-# Restores sleep if owning processes died, timers expired, or battery is critical.
+# Runs as root via launchd. Reads session files / request file and applies the
+# desired sleep state. The loop keeps response time independent of launchd's
+# file-watch scheduling; KeepAlive restarts it if it is terminated.
 set -f
 SUPPORT="/Library/Application Support/awake"
 SESSIONS="$SUPPORT/sessions"
 REQUEST="$SUPPORT/request"
 CONFIG="$SUPPORT/config"
+USER_CONFIG=""
+GUARD
+  printf 'USER_CONFIG=' >> "$GUARD_BIN"
+  printf '%q\n' "${GUARD_USER_CONFIG:-}" >> "$GUARD_BIN"
+  cat >> "$GUARD_BIN" << 'GUARD'
 PMSET=/usr/bin/pmset
+
+while :; do
 now=$(date +%s)
 want=0
 
@@ -540,12 +576,15 @@ if [ "$want" -eq 0 ] && [ -r "$REQUEST" ]; then
   fi
 fi
 
-# 3. Battery Safeguard: Read config preference (default 30%)
+# 3. Battery Safeguard: Read config preference (default 30%). If the shared
+# config became read-only, honor the user's fallback config as well.
 b_en=1
 b_cutoff=30
-if [ -f "$CONFIG" ]; then
-  c_en=$(awk -F= '/^BATTERY_GUARD_ENABLED=/{print $2}' "$CONFIG" 2>/dev/null | tr -d ' "')
-  c_th=$(awk -F= '/^BATTERY_GUARD_THRESHOLD=/{print $2}' "$CONFIG" 2>/dev/null | tr -d ' "%')
+config_file="$USER_CONFIG"
+[ -f "$config_file" ] || config_file="$CONFIG"
+if [ -n "$config_file" ]; then
+  c_en=$(awk -F= '/^BATTERY_GUARD_ENABLED=/{print $2}' "$config_file" 2>/dev/null | tr -d ' "')
+  c_th=$(awk -F= '/^BATTERY_GUARD_THRESHOLD=/{print $2}' "$config_file" 2>/dev/null | tr -d ' "%')
   [ -n "$c_en" ] && b_en="$c_en"
   if [ -n "$c_th" ] && [ "$c_th" -ge 0 ] 2>/dev/null; then
     b_cutoff="$c_th"
@@ -571,6 +610,8 @@ if [ "$want" = 0 ]; then
     echo off > "$REQUEST" 2>/dev/null
   fi
 fi
+sleep 2
+done
 GUARD
   chmod 755 "$GUARD_BIN"
 }
@@ -586,13 +627,8 @@ write_plist() {
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>/usr/local/libexec/awake-guard</string></array>
   <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>15</integer>
-  <key>WatchPaths</key>
-  <array>
-    <string>/Library/Application Support/awake/request</string>
-    <string>/Library/Application Support/awake/sessions</string>
-    <string>/Library/Application Support/awake/config</string>
-  </array>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
   <key>StandardErrorPath</key><string>/var/log/awake-guard.log</string>
 </dict>
 </plist>
@@ -616,6 +652,12 @@ install_awake() {
     echo "Run:  sudo awake --install <your-username>"
     exit 1
   fi
+  local user_home=""
+  if command -v dscl >/dev/null 2>&1; then
+    user_home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  fi
+  [ -n "$user_home" ] || user_home="/Users/$user"
+  GUARD_USER_CONFIG="$user_home/.config/macawake/config"
   mkdir -p "$SUPPORT" "$SESSIONS" "$(dirname "$BIN")"
   : > "$REQUEST"; echo off > "$REQUEST"
   if [ ! -f "$CONFIG" ]; then
@@ -636,7 +678,19 @@ EOF
   write_plist
   if command -v launchctl >/dev/null 2>&1; then
     launchctl bootout "system/$DLABEL" 2>/dev/null || launchctl unload -w "$PLIST" 2>/dev/null || true
-    launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST" 2>/dev/null || true
+    if ! launchctl bootstrap system "$PLIST" 2>/dev/null && ! launchctl load -w "$PLIST" 2>/dev/null; then
+      echo "Failed to register the LaunchDaemon. Check the plist and try the install again."
+      exit 1
+    fi
+    local i
+    for i in $(seq 1 10); do
+      daemon_loaded && break
+      sleep 0.2
+    done
+    if ! daemon_loaded; then
+      echo "LaunchDaemon was registered but is not loaded. Check: awake doctor"
+      exit 1
+    fi
   fi
   "${AWAKE_PMSET:-/usr/bin/pmset}" -a disablesleep 0 2>/dev/null
 
@@ -944,7 +998,7 @@ run_interactive_terminal() {
             local cmd_code=$?
             echo
             echo -e "${C_YELLOW}Command exited with code $cmd_code.${C_RESET}"
-            read -p "Press Enter to return to Trading Terminal..." dummy
+            read -r -p "Press Enter to return to Trading Terminal..."
           fi
           printf '\033[?25l\033[2J'
           notice_msg="[$(date '+%H:%M:%S')] Returned from command execution"

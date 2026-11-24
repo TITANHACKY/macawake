@@ -19,7 +19,7 @@ Run `awake` without arguments in any terminal (or with `awake -t 2h`) to launch 
 
 ```text
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MACAWAKE TRADING TERMINAL  v1.1.0                     ● LIVE  [LID SAFE]    ║
+║  MACAWAKE TRADING TERMINAL  v1.2.0                     ● LIVE  [LID SAFE]    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
   [SYSTEM TICKER]
@@ -124,11 +124,11 @@ MacAwake solves this permanently:
 1. **Zero Admin After Install**: The installer creates a lightweight LaunchDaemon (`com.awake.guard`) running as root in the background.
 2. **Unprivileged Multi-Session IPC**: Daily use only creates unprivileged session files in `/Library/Application Support/awake/sessions/`. The root daemon monitors these files and manages `pmset`.
 3. **Anti-Spoofing Security**: The daemon validates that the PID in the request belongs to the user who registered it.
-4. **Crash-Proof Safety Net**: The LaunchDaemon checks every ~15 seconds and on session change:
+4. **Crash-Proof Safety Net**: The persistent LaunchDaemon checks every two seconds and is restarted by launchd if terminated:
    - Is the session's owning process still alive? If not &rarr; restore normal sleep.
    - Has the timer expired? If so &rarr; restore normal sleep.
    - Is the MacBook on battery with less than the cutoff threshold (default **30%**, user customizable)? If so &rarr; restore normal sleep.
-   - Did the user close Terminal or force-quit (`kill -9`)? The daemon cleans up within 15 seconds.
+   - Did the user close Terminal or force-quit (`kill -9`)? The daemon cleans up within two seconds.
 
 ---
 

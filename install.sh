@@ -42,7 +42,7 @@ printf "${C_CYAN}${C_BOLD}   __  __            _                     _        ${
 printf "${C_CYAN}${C_BOLD}  |  \/  |__ _ __   /_\ __ __ __ __ _ _ _ | |__     ${C_RESET}\n"
 printf "${C_CYAN}${C_BOLD}  | |\/| / _\` / _| / _ \\\\ V  V // _\` | / /| / /     ${C_RESET}\n"
 printf "${C_CYAN}${C_BOLD}  |_|  |_\\__,_\\__|/_/ \\_\\\\_/\\_/ \\__,_|\\_\\| |_\\_\\     ${C_RESET}\n"
-printf "  ${C_DIM}MacAwake v1.1.0 • Lid-closed sleep manager for macOS${C_RESET}\n\n"
+printf "  ${C_DIM}MacAwake v1.2.0 • Lid-closed sleep manager for macOS${C_RESET}\n\n"
 
 # ---- Step 1: System Check ----
 printf "  ${C_BOLD}[1/4] 🍏 Checking system requirements...${C_RESET}\n"
@@ -77,7 +77,7 @@ else
   printf "  ${C_CYAN}⠋${C_RESET} Downloading MacAwake core from GitHub...\r"
   if curl -fsSL --connect-timeout 5 --max-time 30 "$REPO_RAW/awake" -o "$TMP"; then
     if head -1 "$TMP" | grep -q '^#!/bin/bash'; then
-      printf "\r  ${C_GREEN}✓${C_RESET} Downloaded core package (v1.1.0)        \n"
+      printf "\r  ${C_GREEN}✓${C_RESET} Downloaded core package (v1.2.0)        \n"
     else
       printf "\r  ${C_RED}✗${C_RESET} Downloaded file is corrupted or invalid.\n"
       exit 1
