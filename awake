@@ -158,6 +158,44 @@ poll_until() {  # $1=want (0/1), up to ~6s
   return 1
 }
 
+check_battery_guard_preflight() {
+  load_config
+  if [ "$BATT_GUARD" -eq 1 ] && [ "$BATT_THRESHOLD" -gt 0 ]; then
+    get_power_info
+    if [ "$BATT_SRC" = "Battery Power" ] && [ -n "$BATT_PCT" ] && [ "$BATT_PCT" -le "$BATT_THRESHOLD" ] 2>/dev/null; then
+      printf "${C_YELLOW}⚠️  MacAwake Battery Guard Alert:${C_RESET} Current battery is ${C_BOLD}%s%%${C_RESET} (at or below cutoff: %s%%).\n" \
+        "$BATT_PCT" "$BATT_THRESHOLD"
+      printf "MacAwake automatically blocked sleep prevention to protect your Mac from dying.\n\n"
+      printf "To stay awake:\n"
+      printf "  • Connect MagSafe / USB-C power charger, OR\n"
+      local suggested=$(( BATT_PCT > 10 ? BATT_PCT - 5 : 5 ))
+      printf "  • Lower safety cutoff:   ${C_CYAN}awake -b %s${C_RESET}\n" "$suggested"
+      printf "  • Disable safety cutoff: ${C_CYAN}awake -b off${C_RESET}\n\n"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+handle_poll_failure() {
+  local want="$1"
+  if [ "$want" = 1 ]; then
+    load_config
+    get_power_info
+    if [ "$BATT_GUARD" -eq 1 ] && [ "$BATT_THRESHOLD" -gt 0 ] && [ "$BATT_SRC" = "Battery Power" ] && [ -n "$BATT_PCT" ] && [ "$BATT_PCT" -le "$BATT_THRESHOLD" ] 2>/dev/null; then
+      printf "${C_YELLOW}⚠️  MacAwake Battery Guard active:${C_RESET} Sleep prevention was blocked.\n"
+      printf "   Battery is at ${C_BOLD}%s%%${C_RESET} (cutoff is %s%%).\n" "$BATT_PCT" "$BATT_THRESHOLD"
+      printf "   Plug into power or change cutoff: ${C_CYAN}awake -b off${C_RESET} or ${C_CYAN}awake -b %s${C_RESET}\n" "$(( BATT_PCT > 10 ? BATT_PCT - 5 : 5 ))"
+    elif ! launchctl print "system/$DLABEL" >/dev/null 2>&1 && ! launchctl list 2>/dev/null | grep -q "$DLABEL"; then
+      echo "The background service isn't loaded in launchd."
+      echo "Run once during an admin window:  sudo awake --install"
+    else
+      echo "The background service did not respond in time."
+      echo "Run diagnostics:  awake doctor"
+    fi
+  fi
+}
+
 not_set_up() {
   echo "awake isn't set up on this Mac yet (or the service was removed)."
   echo "Run once during an admin window:  sudo awake --install"
@@ -308,7 +346,7 @@ show_status() {
   fi
 
   if command -v launchctl >/dev/null 2>&1; then
-    if launchctl list 2>/dev/null | grep -q "$DLABEL"; then
+    if launchctl print "system/$DLABEL" >/dev/null 2>&1 || launchctl list 2>/dev/null | grep -q "$DLABEL"; then
       echo "  Background Guard : Active (com.awake.guard loaded in launchd)"
     else
       echo "  Background Guard : Not loaded (run: sudo awake --install)"
@@ -369,7 +407,7 @@ run_doctor() {
   fi
 
   if command -v launchctl >/dev/null 2>&1; then
-    if launchctl list 2>/dev/null | grep -q "$DLABEL"; then
+    if launchctl print "system/$DLABEL" >/dev/null 2>&1 || launchctl list 2>/dev/null | grep -q "$DLABEL"; then
       echo "  [✓] LaunchDaemon service: $DLABEL is active"
     else
       echo "  [!] LaunchDaemon service: $DLABEL is not running in launchd"
@@ -686,7 +724,10 @@ render_terminal_view() {
 run_interactive_terminal() {
   local target_secs="$1"
   local initial_label="$2"
-  TUI_ACTIVE=1
+
+  if ! check_battery_guard_preflight; then
+    exit 1
+  fi
 
   load_config
   local batt_guard=$BATT_GUARD
@@ -703,18 +744,19 @@ run_interactive_terminal() {
   session_set on $$ "$until_time"
 
   if ! poll_until 1; then
-    echo "The background service didn't disable sleep. It may have been removed."
-    echo "Reinstall during an admin window:  sudo awake --install"
+    handle_poll_failure 1
     session_remove $$
+    SESSION_FILE=""
     exit 1
   fi
 
+  TUI_ACTIVE=1
   local stty_orig
   stty_orig=$(stty -g 2>/dev/null || true)
-  printf '\033[?25l\033[2J' # Hide cursor & clear screen
+  printf '\033[?1049h\033[?25l' # Enter alternate screen buffer & hide cursor
 
   tui_reset_terminal() {
-    printf '\033[?25h\033[0m\n'
+    printf '\033[?1049l\033[?25h\033[0m\n'
     [ -n "$stty_orig" ] && stty "$stty_orig" 2>/dev/null || true
   }
 
@@ -935,7 +977,7 @@ cleanup() {
   trap - EXIT INT TERM HUP; trap '' USR1
   [ -z "$SESSION_FILE" ] && return 0
 
-  printf '\033[?25h\033[0m' 2>/dev/null || true
+  printf '\033[?1049l\033[?25h\033[0m' 2>/dev/null || true
   stty echo 2>/dev/null || true
 
   for pid in "$CMD_PID" "$TIMER_PID" "$IDLE_PID"; do
@@ -948,16 +990,15 @@ cleanup() {
 
   session_remove "$$"
 
-  if [ "$TUI_ACTIVE" -eq 0 ]; then
+  if [ "$TUI_ACTIVE" -eq 1 ]; then
+    echo "Sleep restored. Have a great day!"
+  else
     echo
     if poll_until 0; then
       echo "Sleep restored."
     else
       echo "WARNING: sleep may still be disabled. Run:  awake --off"
     fi
-  else
-    printf '\033[2J\033[H'
-    echo "Sleep restored. Have a great day!"
   fi
 }
 
@@ -1069,10 +1110,14 @@ UNTIL=0
 
 if [ $# -gt 0 ]; then
   # 1. Command Execution Mode (stays awake while command runs)
+  if ! check_battery_guard_preflight; then
+    exit 1
+  fi
   session_set on $$ "$UNTIL"
   if ! poll_until 1; then
-    echo "The background service didn't disable sleep. Reinstall: sudo awake --install"
+    handle_poll_failure 1
     session_remove $$
+    SESSION_FILE=""
     exit 1
   fi
 
@@ -1094,10 +1139,14 @@ elif [ "$INTERACTIVE_FORCE" -eq 1 ] || { [ "$PLAIN_FORCE" -eq 0 ] && [ -t 0 ]; }
 
 else
   # 3. Plain Background / Script Mode
+  if ! check_battery_guard_preflight; then
+    exit 1
+  fi
   session_set on $$ "$UNTIL"
   if ! poll_until 1; then
-    echo "The background service didn't disable sleep. Reinstall: sudo awake --install"
+    handle_poll_failure 1
     session_remove $$
+    SESSION_FILE=""
     exit 1
   fi
 
