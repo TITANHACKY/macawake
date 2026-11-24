@@ -901,27 +901,97 @@ uninstall_awake() {
 # ---- Trading Terminal TUI ----
 
 terminal_width() {
-  local width="${COLUMNS:-}"
-  if ! [[ "$width" =~ ^[0-9]+$ ]]; then
-    width=$(tput cols 2>/dev/null || echo 80)
+  local width=""
+  width=$(stty size 2>/dev/null | awk '{print $2}')
+  if ! [[ "$width" =~ ^[0-9]+$ ]] || [ "$width" -lt 20 ]; then
+    width=$(tput cols 2>/dev/null || true)
+  fi
+  if ! [[ "$width" =~ ^[0-9]+$ ]] || [ "$width" -lt 20 ]; then
+    width="${COLUMNS:-}"
   fi
   [[ "$width" =~ ^[0-9]+$ ]] || width=80
   echo "$width"
 }
 
+read_clean_line() {
+  TUI_LINE=""
+  local line=""
+  IFS= read -r line || return 1
+  TUI_LINE=$(printf '%s' "$line" | sed -E $'s/\033\\[[0-9;?<>]*[A-Za-z]//g' | tr -d '\r')
+  return 0
+}
+
+read_tui_key() {
+  TUI_KEY=""
+  local first="" c1="" c2="" c=""
+  IFS= read -r -s -n 1 -t 1 first || return 1
+  if [ "$first" = $'\033' ]; then
+    IFS= read -r -s -n 1 -t 0.05 c1 || return 0
+    [ "$c1" = '[' ] || return 0
+    IFS= read -r -s -n 1 -t 0.05 c2 || return 0
+    case "$c2" in
+      A) TUI_KEY='+' ;;
+      B) TUI_KEY='-' ;;
+      C) TUI_KEY='e' ;;
+      D) TUI_KEY='p' ;;
+      '<')
+        # SGR mouse events, including scroll, end with M or m. Consume them.
+        while IFS= read -r -s -n 1 -t 0.05 c; do
+          case "$c" in
+            M|m) break ;;
+          esac
+        done
+        ;;
+      M)
+        # Legacy X10 mouse events contain three bytes after ESC [ M.
+        IFS= read -r -s -n 3 -t 0.05 c || true
+        ;;
+      *)
+        # Consume other CSI sequences such as Home, End, and function keys.
+        while IFS= read -r -s -n 1 -t 0.05 c; do
+          case "$c" in
+            [@-~]) break ;;
+          esac
+        done
+        ;;
+    esac
+  else
+    TUI_KEY="$first"
+  fi
+  return 0
+}
+
+compact_progress_bar() {
+  local pct="$1" width="${2:-20}" filled empty i
+  [ "$pct" -lt 0 ] && pct=0
+  [ "$pct" -gt 100 ] && pct=100
+  filled=$(( pct * width / 100 ))
+  empty=$(( width - filled ))
+  printf '['
+  for ((i=0; i<filled; i++)); do printf '#'; done
+  for ((i=0; i<empty; i++)); do printf '-'; done
+  printf '] %3d%%' "$pct"
+}
+
 render_compact_view() {
   local rem_str="$1" end_str="$2" pct="$3" elapsed_str="$4" pwr_str="$5" notice="$6" is_paused="$7" show_help="$8" b_guard="$9" b_thresh="${10}" daemon_state="${11}" sleep_state="${12}"
-  local b_label="OFF"
+  local b_label="OFF" status_color="$C_YELLOW" status_mark="!"
   [ "$b_guard" -eq 1 ] && [ "$b_thresh" -gt 0 ] && b_label="ON <=${b_thresh}%"
+  case "$sleep_state" in
+    DISABLED) status_color="$C_GREEN"; status_mark="OK" ;;
+    PAUSED|STARTING|NORMAL) status_color="$C_YELLOW"; status_mark="WAIT" ;;
+    *) status_color="$C_RED"; status_mark="ERR" ;;
+  esac
 
-  printf "MacAwake v%s | Sleep: %s | Daemon: %s\n" "$VERSION" "$sleep_state" "$daemon_state"
-  printf "Session: PID %s | Power: %s | Battery guard: %s\n" "$$" "$pwr_str" "$b_label"
-  printf "Remaining: %s | Target: %s | Progress: %s%% | Elapsed: %s\n" "$rem_str" "$end_str" "$pct" "$elapsed_str"
-  printf "Status: %s\n" "$notice"
+  printf "${C_CYAN}+--${C_RESET} ${C_BOLD}MacAwake${C_RESET} ${C_DIM}v%s${C_RESET}  ${status_color}%s %s${C_RESET}  ${C_DIM}PID %s${C_RESET}\n" "$VERSION" "$status_mark" "$sleep_state" "$$"
+  printf "${C_CYAN}|${C_RESET} ${C_BOLD}SLEEP${C_RESET} %-10s ${C_DIM}|${C_RESET} ${C_BOLD}DAEMON${C_RESET} %-11s ${C_DIM}|${C_RESET} ${C_BOLD}POWER${C_RESET} %s\n" "$sleep_state" "$daemon_state" "$pwr_str"
+  printf "${C_CYAN}|${C_RESET} ${C_BOLD}BATTERY${C_RESET} %-8s ${C_DIM}|${C_RESET} ${C_BOLD}SESSION${C_RESET} %-9s ${C_DIM}|${C_RESET} ${C_BOLD}ELAPSED${C_RESET} %s\n" "$b_label" "$$" "$elapsed_str"
+  printf "${C_CYAN}|${C_RESET} ${C_BOLD}REMAINING${C_RESET} %-15s ${C_DIM}|${C_RESET} ${C_BOLD}TARGET${C_RESET} %s\n" "$rem_str" "$end_str"
+  printf "${C_CYAN}|${C_RESET} ${C_BOLD}PROGRESS${C_RESET} ${C_MAGENTA}"; compact_progress_bar "$pct" 18; printf "${C_RESET}\n"
+  printf "${C_CYAN}|${C_RESET} ${C_YELLOW}FEED${C_RESET} %s\n" "$notice"
+  printf "${C_CYAN}+--${C_RESET} ${C_DIM}Keys${C_RESET} ${C_CYAN}[+/-]${C_RESET} timer  ${C_CYAN}[p]${C_RESET} pause  ${C_CYAN}[t]${C_RESET} set  ${C_CYAN}[b]${C_RESET} battery  ${C_CYAN}[?]${C_RESET} help  ${C_RED}[q]${C_RESET} quit\n"
   if [ "$show_help" -eq 1 ]; then
-    printf "Keys: +/e extend  - shorten  t timer  p pause  d display  b battery  r command  q quit\n"
-  else
-    printf "Keys: +/e extend  - shorten  t timer  p pause  b battery  ? help  q quit\n"
+    printf "${C_DIM}  More: [d] display off  [r] run command  [e] extend  [h/?] close help${C_RESET}\n"
   fi
 }
 
@@ -1023,10 +1093,10 @@ run_interactive_terminal() {
   TUI_ACTIVE=1
   local stty_orig
   stty_orig=$(stty -g 2>/dev/null || true)
-  printf '\033[?1049h\033[?25l' # Enter alternate screen buffer & hide cursor
+  printf '\033[?1049h\033[?1000h\033[?1006h\033[?25l' # Alternate screen, mouse capture, hidden cursor
 
   tui_reset_terminal() {
-    printf '\033[?1049l\033[?25h\033[0m\n'
+    printf '\033[?1006l\033[?1000l\033[?1049l\033[?25h\033[0m\n'
     [ -n "$stty_orig" ] && stty "$stty_orig" 2>/dev/null || true
   }
 
@@ -1046,7 +1116,7 @@ run_interactive_terminal() {
       get_power_info
     fi
 
-    [ "$(terminal_width)" -lt 90 ] && compact=1 || compact=0
+    [ "$(terminal_width)" -lt 70 ] && compact=1 || compact=0
     daemon_health_state "$paused" >/dev/null
     local sleep_state="NORMAL"
     case "$DAEMON_HEALTH_STATE" in
@@ -1080,7 +1150,7 @@ run_interactive_terminal() {
       rem_secs=$(( until_time - now ))
       if [ "$rem_secs" -le 0 ]; then
         notice_msg="Time is up ($initial_label). Restoring normal sleep..."
-        printf '\033[H'
+        printf '\033[2J\033[H'
         local pwr_label="AC Connected (${BATT_PCT}%)"
         [ "$BATT_SRC" = "Battery Power" ] && pwr_label="Battery (${BATT_PCT}%)"
         render_terminal_view "00h 00m 00s" "$end_str" 100 "$elapsed_str" "$pwr_label" "$notice_msg" "$paused" "$show_help_modal" "$batt_guard" "$batt_threshold" "$DAEMON_HEALTH_STATE" "$sleep_state" "$compact"
@@ -1101,11 +1171,12 @@ run_interactive_terminal() {
       pwr_display="Battery (${BATT_PCT}%$trem)"
     fi
 
-    printf '\033[H'
+    printf '\033[2J\033[H'
     render_terminal_view "$rem_str" "$end_str" "$pct" "$elapsed_str" "$pwr_display" "$notice_msg" "$paused" "$show_help_modal" "$batt_guard" "$batt_threshold" "$DAEMON_HEALTH_STATE" "$sleep_state" "$compact"
 
     local key=""
-    read -s -n 1 -t 1 key 2>/dev/null || true
+    read_tui_key || true
+    key="$TUI_KEY"
 
     if [ -n "$key" ]; then
       case "$key" in
@@ -1141,7 +1212,8 @@ run_interactive_terminal() {
           printf '\033[?25h'
           printf '\033[23;1H\033[K\033[1;33mFEED > Enter duration (e.g. 45m, 2h, 30s, inf):\033[0m '
           local user_dur=""
-          read -r user_dur
+          read_clean_line || true
+          user_dur="$TUI_LINE"
           printf '\033[?25l'
           if [ "$user_dur" = "inf" ] || [ "$user_dur" = "0" ] || [ -z "$user_dur" ]; then
             until_time=0
@@ -1185,7 +1257,8 @@ run_interactive_terminal() {
           printf '\033[?25h'
           printf '\033[23;1H\033[K\033[1;33mFEED > Battery cutoff %% [current: %s%%, "off" to disable, or Enter to toggle]:\033[0m ' "$batt_threshold"
           local user_b=""
-          read -r user_b
+          read_clean_line || true
+          user_b="$TUI_LINE"
           printf '\033[?25l'
           user_b=$(echo "$user_b" | tr -d '% ')
           if [ -z "$user_b" ]; then
@@ -1233,7 +1306,9 @@ run_interactive_terminal() {
           echo -e "${C_CYAN}=== Execute Command Under MacAwake ===${C_RESET}"
           echo "Mac will stay awake while this command executes."
           echo
-          read -p "Command to run: " -r user_cmd
+          printf "Command to run: "
+          read_clean_line || true
+          user_cmd="$TUI_LINE"
           if [ -n "$user_cmd" ]; then
             echo -e "${C_DIM}Running: $user_cmd${C_RESET}\n"
             eval "$user_cmd"
