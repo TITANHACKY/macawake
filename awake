@@ -4,15 +4,19 @@
 # Designed for MDM-managed Macs that grant admin for only a few minutes.
 # Admin is needed ONCE, for setup. After that, no admin or password is needed.
 #
-# Version: 1.2.0
+# Version: 1.3.0
 
-set -f
+shopt -s nullglob
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 R="${AWAKE_TEST_ROOT:-}"
 SUPPORT="$R/Library/Application Support/awake"
-SESSIONS="$SUPPORT/sessions"
-REQUEST="$SUPPORT/request"
+SESSION_ROOT="$SUPPORT/sessions"
+SESSIONS="$SESSION_ROOT/$UID"
+REQUEST_ROOT="$SUPPORT/requests"
+REQUEST="$REQUEST_ROOT/$UID"
+STATUS_ROOT="$SUPPORT/status"
+STATUS="$STATUS_ROOT/$UID"
 CONFIG="$SUPPORT/config"
 USER_CONFIG="$HOME/.config/macawake/config"
 LIBEXEC="$R/usr/local/libexec"
@@ -125,6 +129,65 @@ sleep_is_disabled() {
   [ "$("$PM" -g 2>/dev/null | awk '/SleepDisabled/{print $2}')" = "1" ]
 }
 
+DAEMON_STATUS_TIMESTAMP=0
+DAEMON_STATUS_PID=""
+DAEMON_STATUS_DESIRED=0
+DAEMON_STATUS_SLEEP_DISABLED=0
+DAEMON_STATUS_SESSIONS=0
+DAEMON_STATUS_REASON="unknown"
+DAEMON_STATUS_ERROR=0
+DAEMON_HEALTH_STATE="UNKNOWN"
+
+read_daemon_status() {
+  DAEMON_STATUS_TIMESTAMP=0
+  DAEMON_STATUS_PID=""
+  DAEMON_STATUS_DESIRED=0
+  DAEMON_STATUS_SLEEP_DISABLED=0
+  DAEMON_STATUS_SESSIONS=0
+  DAEMON_STATUS_REASON="unknown"
+  DAEMON_STATUS_ERROR=0
+  [ -r "$STATUS" ] || return 1
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      timestamp) DAEMON_STATUS_TIMESTAMP="$value" ;;
+      pid) DAEMON_STATUS_PID="$value" ;;
+      desired) DAEMON_STATUS_DESIRED="$value" ;;
+      sleep_disabled) DAEMON_STATUS_SLEEP_DISABLED="$value" ;;
+      sessions) DAEMON_STATUS_SESSIONS="$value" ;;
+      reason) DAEMON_STATUS_REASON="$value" ;;
+      pmset_error) DAEMON_STATUS_ERROR="$value" ;;
+    esac
+  done < "$STATUS"
+  [[ "$DAEMON_STATUS_TIMESTAMP" =~ ^[0-9]+$ ]] || return 1
+  return 0
+}
+
+daemon_health_state() {
+  local paused="${1:-0}" now age
+  if ! read_daemon_status; then
+    DAEMON_HEALTH_STATE="UNKNOWN"
+    echo "$DAEMON_HEALTH_STATE"
+    return 0
+  fi
+  now=$(date +%s)
+  age=$(( now - DAEMON_STATUS_TIMESTAMP ))
+  if [ "$age" -lt 0 ] || [ "$age" -gt 8 ]; then
+    DAEMON_HEALTH_STATE="UNAVAILABLE"
+  elif [ "$DAEMON_STATUS_ERROR" = 1 ]; then
+    DAEMON_HEALTH_STATE="DEGRADED"
+  elif [ "$paused" = 1 ] || [ "$DAEMON_STATUS_REASON" = "paused" ]; then
+    DAEMON_HEALTH_STATE="PAUSED"
+  elif [ "$DAEMON_STATUS_DESIRED" = 1 ] && [ "$DAEMON_STATUS_SLEEP_DISABLED" = 1 ]; then
+    DAEMON_HEALTH_STATE="HEALTHY"
+  elif [ "$DAEMON_STATUS_DESIRED" = 1 ]; then
+    DAEMON_HEALTH_STATE="STARTING"
+  else
+    DAEMON_HEALTH_STATE="IDLE"
+  fi
+  echo "$DAEMON_HEALTH_STATE"
+}
+
 request_set() {
   local tmp="${REQUEST}.tmp.$$"
   if printf '%s\n' "$1" > "$tmp" 2>/dev/null && mv -f "$tmp" "$REQUEST" 2>/dev/null; then
@@ -163,12 +226,22 @@ session_remove() {
   local count=0
   if [ -d "$SESSIONS" ]; then
     for sf in "$SESSIONS"/*.session; do
-      [ -e "$sf" ] && count=$((count + 1))
+      count=$((count + 1))
     done
   fi
   if [ "$count" -eq 0 ]; then
     request_set "off"
   fi
+}
+
+session_count() {
+  local count=0 sf
+  if [ -d "$SESSIONS" ]; then
+    for sf in "$SESSIONS"/*.session; do
+      count=$((count + 1))
+    done
+  fi
+  echo "$count"
 }
 
 poll_until() {  # $1=want (0/1), up to ~6s
@@ -209,12 +282,21 @@ handle_poll_failure() {
       printf "${C_YELLOW}⚠️  MacAwake Battery Guard active:${C_RESET} Sleep prevention was blocked.\n"
       printf "   Battery is at ${C_BOLD}%s%%${C_RESET} (cutoff is %s%%).\n" "$BATT_PCT" "$BATT_THRESHOLD"
       printf "   Plug into power or change cutoff: ${C_CYAN}awake -b off${C_RESET} or ${C_CYAN}awake -b %s${C_RESET}\n" "$(( BATT_PCT > 10 ? BATT_PCT - 5 : 5 ))"
-    elif ! daemon_loaded; then
-      echo "The background service isn't loaded in launchd."
-      echo "Run once during an admin window:  sudo awake --install"
     else
-      echo "The background service did not respond in time."
-      echo "Run diagnostics:  awake doctor"
+      daemon_health_state 0 >/dev/null
+      if [ "$DAEMON_HEALTH_STATE" = "UNAVAILABLE" ] || [ "$DAEMON_HEALTH_STATE" = "UNKNOWN" ]; then
+        echo "The background service isn't reporting a heartbeat."
+        echo "Run diagnostics:  awake doctor"
+      elif [ "$DAEMON_HEALTH_STATE" = "DEGRADED" ]; then
+        echo "The background service reported a pmset error."
+        echo "Run diagnostics:  awake doctor"
+      elif ! daemon_loaded; then
+        echo "The background service isn't loaded in launchd."
+        echo "Run once during an admin window:  sudo awake --install"
+      else
+        echo "The background service did not respond in time."
+        echo "Run diagnostics:  awake doctor"
+      fi
     fi
   fi
 }
@@ -313,7 +395,8 @@ OPTIONS:
     -t <duration>              Timer duration (e.g. 45, 30s, 15m, 2h, 1h30m; plain number = minutes)
     -b, --battery-guard [N%]   Set or view battery cutoff preference (default: 30%, 'off' to disable)
     -s, --status               Show sleep status, active sessions, and battery power metrics
-    --off                      Restore normal sleep immediately and deactivate sleep prevention
+    --off [PID]                Stop one session by PID, or all sessions for this account
+    --off --all                Explicit alias for stopping all sessions for this account
     -d, --doctor               Run diagnostics on daemon, permissions, and system settings
     -v, --version              Show version information
     -h, --help                 Display this help guide
@@ -331,7 +414,7 @@ TRADING TERMINAL HOTKEYS:
     [b]         Set or toggle battery guard threshold (current: ${BATT_THRESHOLD}%)
     [r]         Execute shell command while holding awake lock
     [?] / [h]   Toggle help cheat sheet modal
-    [q]         Exit cleanly and restore normal sleep
+    [q]         Exit cleanly and restore sleep for this session
 
 HOW IT WORKS:
     macOS normally sleeps when the laptop lid closes, ignoring caffeinate and power
@@ -354,6 +437,7 @@ show_version() {
 show_status() {
   get_power_info
   load_config
+  daemon_health_state 0 >/dev/null
   echo "MacAwake Status:"
   if sleep_is_disabled; then
     echo "  Sleep Prevention : ENABLED (Mac stays awake with lid closed)"
@@ -380,6 +464,12 @@ show_status() {
       echo "  Background Guard : Not loaded (run: sudo awake --install)"
     fi
   fi
+  echo "  Daemon Health    : $DAEMON_HEALTH_STATE"
+  if read_daemon_status; then
+    echo "  Daemon Heartbeat  : ${DAEMON_STATUS_TIMESTAMP} (${DAEMON_STATUS_REASON}, sessions: ${DAEMON_STATUS_SESSIONS})"
+  else
+    echo "  Daemon Heartbeat  : unavailable"
+  fi
 
   echo "  Active Sessions  :"
   local count=0
@@ -387,7 +477,6 @@ show_status() {
     local now
     now=$(date +%s)
     for sf in "$SESSIONS"/*.session; do
-      [ -e "$sf" ] || continue
       local spid="" suid="" suntil=0 sstate="on"
       for kv in $(cat "$sf" 2>/dev/null); do
         case "$kv" in
@@ -450,6 +539,17 @@ run_doctor() {
     echo "      Fix: sudo awake --install"
   fi
 
+  daemon_health_state 0 >/dev/null
+  case "$DAEMON_HEALTH_STATE" in
+    HEALTHY|IDLE|PAUSED|STARTING)
+      echo "  [✓] Daemon heartbeat: $DAEMON_HEALTH_STATE"
+      ;;
+    *)
+      echo "  [!] Daemon heartbeat: $DAEMON_HEALTH_STATE"
+      echo "      Fix: sudo awake --install, then run awake doctor again"
+      ;;
+  esac
+
   if [ -d "$SUPPORT" ]; then
     echo "  [✓] App Support directory: Found at $SUPPORT"
     if [ -w "$REQUEST" ]; then
@@ -488,10 +588,29 @@ run_doctor() {
 
 turn_off() {
   [ -d "$SUPPORT" ] || not_set_up
-  rm -f "$SESSIONS"/*.session 2>/dev/null || true
+  local target_pid="${1:-}" removed=0 sf spid
+  for sf in "$SESSIONS"/*.session; do
+    spid=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^pid=/) {sub(/^pid=/, "", $i); print $i; exit}}' "$sf" 2>/dev/null)
+    if [ -z "$target_pid" ] || [ "$spid" = "$target_pid" ]; then
+      rm -f "$sf" 2>/dev/null || true
+      removed=$((removed + 1))
+    fi
+  done
+  if [ "$(session_count)" -gt 0 ]; then
+    if [ "$removed" -gt 0 ]; then
+      echo "Stopped session $target_pid. Other awake sessions remain active."
+    else
+      echo "No matching awake session found. Other awake sessions remain active."
+    fi
+    return 0
+  fi
   request_set off
   if poll_until 0; then
-    echo "Sleep is back to normal."
+    if [ "$removed" -gt 0 ]; then
+      echo "Sleep is back to normal."
+    else
+      echo "No active awake session found. Sleep is normal."
+    fi
   else
     echo "Service didn't respond. Is it installed? Try reinstalling with: sudo awake --install"
   fi
@@ -501,31 +620,48 @@ turn_off() {
 
 write_guard() {
   mkdir -p "$LIBEXEC"
-  cat > "$GUARD_BIN" << 'GUARD'
+  local guard_tmp="${GUARD_BIN}.tmp.$$"
+  cat > "$guard_tmp" << 'GUARD'
 #!/bin/bash
-# Runs as root via launchd. Reads session files / request file and applies the
+# Runs as root via launchd. Reads the target user's session and request files and applies the
 # desired sleep state. The loop keeps response time independent of launchd's
 # file-watch scheduling; KeepAlive restarts it if it is terminated.
-set -f
+shopt -s nullglob
 SUPPORT="/Library/Application Support/awake"
 SESSIONS="$SUPPORT/sessions"
 REQUEST="$SUPPORT/request"
 CONFIG="$SUPPORT/config"
+STATUS="$SUPPORT/status"
 USER_CONFIG=""
 GUARD
-  printf 'USER_CONFIG=' >> "$GUARD_BIN"
-  printf '%q\n' "${GUARD_USER_CONFIG:-}" >> "$GUARD_BIN"
-  cat >> "$GUARD_BIN" << 'GUARD'
+  printf 'SESSIONS=%q\nREQUEST=%q\nSTATUS=%q\nUSER_CONFIG=%q\n' \
+    "${GUARD_SESSIONS:-$SESSIONS}" "${GUARD_REQUEST:-$REQUEST}" \
+    "${GUARD_STATUS:-$STATUS}" "${GUARD_USER_CONFIG:-}" >> "$guard_tmp"
+  cat >> "$guard_tmp" << 'GUARD'
 PMSET=/usr/bin/pmset
+
+write_status() {
+  local tmp="${STATUS}.tmp.$$"
+  mkdir -p "$(dirname "$STATUS")" 2>/dev/null || return 1
+  printf 'timestamp=%s\npid=%s\ndesired=%s\nsleep_disabled=%s\nsessions=%s\nreason=%s\npmset_error=%s\n' \
+    "$now" "$$" "$want" "$cur" "$active_sessions" "$reason" "$pmset_error" > "$tmp" 2>/dev/null || return 1
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$STATUS" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  }
+}
 
 while :; do
 now=$(date +%s)
 want=0
+active_sessions=0
+reason="no_sessions"
+pmset_error=0
 
 # 1. Check all multi-session files
 if [ -d "$SESSIONS" ]; then
   for sfile in "$SESSIONS"/*.session; do
-    [ -e "$sfile" ] || continue
     s_pid=""; s_uid=""; s_until=0; s_state="on"
     for kv in $(cat "$sfile" 2>/dev/null); do
       case "$kv" in
@@ -553,6 +689,7 @@ if [ -d "$SESSIONS" ]; then
     fi
 
     if [ "$valid" -eq 1 ]; then
+      active_sessions=$((active_sessions + 1))
       [ "$s_state" = "on" ] && want=1
     else
       rm -f "$sfile" 2>/dev/null
@@ -560,13 +697,14 @@ if [ -d "$SESSIONS" ]; then
   done
 fi
 
-# 2. Compatibility check with legacy request file
+# 2. Compatibility check with the per-user request file
 if [ "$want" -eq 0 ] && [ -r "$REQUEST" ]; then
   req=$(cat "$REQUEST" 2>/dev/null)
-  set -- $req
-  if [ "$1" = "on" ]; then
-    legit=1; shift
-    for kv in "$@"; do
+  req_parts=()
+  read -r -a req_parts <<< "$req"
+  if [ "${req_parts[0]}" = "on" ]; then
+    legit=1
+    for kv in "${req_parts[@]:1}"; do
       case "$kv" in
         pid=*)   p=${kv#pid=};   kill -0 "$p" 2>/dev/null || legit=0 ;;
         until=*) u=${kv#until=}; [ "$now" -lt "$u" ] 2>/dev/null || legit=0 ;;
@@ -591,34 +729,50 @@ if [ -n "$config_file" ]; then
   fi
 fi
 
-if [ "$b_en" -eq 1 ] && [ "$b_cutoff" -gt 0 ]; then
-  batt_src=$("$PMSET" -g batt 2>/dev/null | awk -F"'" 'NR==1{print $2}')
+if [ "$want" -eq 1 ] && [ "$b_en" -eq 1 ] && [ "$b_cutoff" -gt 0 ]; then
+  batt_raw=$("$PMSET" -g batt 2>/dev/null || true)
+  batt_src=$(printf '%s\n' "$batt_raw" | awk -F"'" 'NR==1{print $2}')
   if [ "$batt_src" = "Battery Power" ]; then
-    batt_lvl=$("$PMSET" -g batt 2>/dev/null | grep -Eo '[0-9]+%' | head -1 | tr -d '%')
+    batt_lvl=$(printf '%s\n' "$batt_raw" | grep -Eo '[0-9]+%' | head -1 | tr -d '%')
     if [ -n "$batt_lvl" ] && [ "$batt_lvl" -le "$b_cutoff" ] 2>/dev/null; then
       want=0
+      reason="battery_low"
     fi
   fi
 fi
 
+[ "$want" -eq 1 ] && reason="active"
+[ "$active_sessions" -gt 0 ] && [ "$want" -eq 0 ] && [ "$reason" = "no_sessions" ] && reason="paused"
+
 # 4. Apply state if changed
 cur=$("$PMSET" -g 2>/dev/null | awk '/SleepDisabled/{print $2}'); [ -n "$cur" ] || cur=0
-if [ "$want" = 1 ] && [ "$cur" != 1 ]; then "$PMSET" -a disablesleep 1; fi
+if [ "$want" = 1 ] && [ "$cur" != 1 ]; then
+  "$PMSET" -a disablesleep 1 || { pmset_error=1; reason="pmset_error"; }
+fi
 if [ "$want" = 0 ]; then
-  [ "$cur" != 0 ] && "$PMSET" -a disablesleep 0
+  if [ "$cur" != 0 ]; then
+    "$PMSET" -a disablesleep 0 || { pmset_error=1; reason="pmset_error"; }
+  fi
   if [ -r "$REQUEST" ] && [ "$(cat "$REQUEST" 2>/dev/null)" != "off" ]; then
     echo off > "$REQUEST" 2>/dev/null
   fi
 fi
+cur=$("$PMSET" -g 2>/dev/null | awk '/SleepDisabled/{print $2}'); [ -n "$cur" ] || cur=0
+write_status || true
 sleep 2
 done
 GUARD
-  chmod 755 "$GUARD_BIN"
+  if ! chmod 755 "$guard_tmp" || ! bash -n "$guard_tmp"; then
+    rm -f "$guard_tmp"
+    return 1
+  fi
+  mv -f "$guard_tmp" "$GUARD_BIN"
 }
 
 write_plist() {
+  local plist_tmp="${PLIST}.tmp.$$"
   mkdir -p "$(dirname "$PLIST")"
-  cat > "$PLIST" << PLIST
+  cat > "$plist_tmp" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -633,7 +787,15 @@ write_plist() {
 </dict>
 </plist>
 PLIST
-  chmod 644 "$PLIST"
+  if ! chmod 644 "$plist_tmp"; then
+    rm -f "$plist_tmp"
+    return 1
+  fi
+  if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$plist_tmp" >/dev/null 2>&1; then
+    rm -f "$plist_tmp"
+    return 1
+  fi
+  mv -f "$plist_tmp" "$PLIST"
 }
 
 install_awake() {
@@ -657,9 +819,14 @@ install_awake() {
     user_home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
   fi
   [ -n "$user_home" ] || user_home="/Users/$user"
+  local target_uid
+  target_uid=$(id -u "$user")
+  GUARD_SESSIONS="$SESSION_ROOT/$target_uid"
+  GUARD_REQUEST="$REQUEST_ROOT/$target_uid"
+  GUARD_STATUS="$STATUS_ROOT/$target_uid"
   GUARD_USER_CONFIG="$user_home/.config/macawake/config"
-  mkdir -p "$SUPPORT" "$SESSIONS" "$(dirname "$BIN")"
-  : > "$REQUEST"; echo off > "$REQUEST"
+  mkdir -p "$SUPPORT" "$SESSION_ROOT" "$GUARD_SESSIONS" "$REQUEST_ROOT" "$STATUS_ROOT" "$(dirname "$BIN")"
+  : > "$GUARD_REQUEST"; echo off > "$GUARD_REQUEST"
   if [ ! -f "$CONFIG" ]; then
     cat > "$CONFIG" << EOF
 BATTERY_GUARD_ENABLED=$DEFAULT_BATT_GUARD
@@ -668,14 +835,27 @@ EOF
   fi
   chown -R "$user" "$SUPPORT"
   chmod 755 "$SUPPORT"
-  chmod 1777 "$SESSIONS" 2>/dev/null || chmod 777 "$SESSIONS"
-  chown "$user" "$REQUEST"; chmod 644 "$REQUEST"
+  chmod 755 "$SESSION_ROOT" "$REQUEST_ROOT" "$STATUS_ROOT"
+  chmod 700 "$GUARD_SESSIONS"
+  chown "$user" "$GUARD_SESSIONS"; chmod 700 "$GUARD_SESSIONS"
+  chown "$user" "$GUARD_REQUEST"; chmod 644 "$GUARD_REQUEST"
   chown "$user" "$CONFIG" 2>/dev/null || true
   chmod 644 "$CONFIG" 2>/dev/null || true
 
-  install -m 755 "$0" "$BIN"
-  write_guard
-  write_plist
+  local bin_tmp="${BIN}.tmp.$$"
+  if ! install -m 755 "$0" "$bin_tmp" || ! bash -n "$bin_tmp" || ! mv -f "$bin_tmp" "$BIN"; then
+    rm -f "$bin_tmp"
+    echo "Failed to install the awake CLI."
+    exit 1
+  fi
+  if ! write_guard; then
+    echo "Failed to generate the background guard safely."
+    exit 1
+  fi
+  if ! write_plist; then
+    echo "Failed to generate a valid LaunchDaemon plist."
+    exit 1
+  fi
   if command -v launchctl >/dev/null 2>&1; then
     launchctl bootout "system/$DLABEL" 2>/dev/null || launchctl unload -w "$PLIST" 2>/dev/null || true
     if ! launchctl bootstrap system "$PLIST" 2>/dev/null && ! launchctl load -w "$PLIST" 2>/dev/null; then
@@ -720,11 +900,41 @@ uninstall_awake() {
 
 # ---- Trading Terminal TUI ----
 
+terminal_width() {
+  local width="${COLUMNS:-}"
+  if ! [[ "$width" =~ ^[0-9]+$ ]]; then
+    width=$(tput cols 2>/dev/null || echo 80)
+  fi
+  [[ "$width" =~ ^[0-9]+$ ]] || width=80
+  echo "$width"
+}
+
+render_compact_view() {
+  local rem_str="$1" end_str="$2" pct="$3" elapsed_str="$4" pwr_str="$5" notice="$6" is_paused="$7" show_help="$8" b_guard="$9" b_thresh="${10}" daemon_state="${11}" sleep_state="${12}"
+  local b_label="OFF"
+  [ "$b_guard" -eq 1 ] && [ "$b_thresh" -gt 0 ] && b_label="ON <=${b_thresh}%"
+
+  printf "MacAwake v%s | Sleep: %s | Daemon: %s\n" "$VERSION" "$sleep_state" "$daemon_state"
+  printf "Session: PID %s | Power: %s | Battery guard: %s\n" "$$" "$pwr_str" "$b_label"
+  printf "Remaining: %s | Target: %s | Progress: %s%% | Elapsed: %s\n" "$rem_str" "$end_str" "$pct" "$elapsed_str"
+  printf "Status: %s\n" "$notice"
+  if [ "$show_help" -eq 1 ]; then
+    printf "Keys: +/e extend  - shorten  t timer  p pause  d display  b battery  r command  q quit\n"
+  else
+    printf "Keys: +/e extend  - shorten  t timer  p pause  b battery  ? help  q quit\n"
+  fi
+}
+
 render_terminal_view() {
-  local rem_str="$1" end_str="$2" pct="$3" elapsed_str="$4" pwr_str="$5" notice="$6" is_paused="$7" show_help="$8" b_guard="$9" b_thresh="${10}"
+  local rem_str="$1" end_str="$2" pct="$3" elapsed_str="$4" pwr_str="$5" notice="$6" is_paused="$7" show_help="$8" b_guard="$9" b_thresh="${10}" daemon_state="${11}" sleep_state="${12}" compact="${13:-0}"
+
+  if [ "$compact" -eq 1 ] || [ "${AWAKE_ASCII:-0}" -eq 1 ]; then
+    render_compact_view "$rem_str" "$end_str" "$pct" "$elapsed_str" "$pwr_str" "$notice" "$is_paused" "$show_help" "$b_guard" "$b_thresh" "$daemon_state" "$sleep_state"
+    return
+  fi
   
   printf "${C_CYAN}╔══════════════════════════════════════════════════════════════════════════════╗${C_RESET}\n"
-  printf "${C_CYAN}║${C_RESET}  ${C_BOLD}MACAWAKE TRADING TERMINAL  v${VERSION}${C_RESET}                     ${C_GREEN}● LIVE  [LID SAFE]${C_RESET}    ${C_CYAN}║${C_RESET}\n"
+  printf "${C_CYAN}║${C_RESET}  ${C_BOLD}MACAWAKE TRADING TERMINAL  v${VERSION}${C_RESET}                     ${C_GREEN}%s${C_RESET}    ${C_CYAN}║${C_RESET}\n" "$daemon_state"
   printf "${C_CYAN}╚══════════════════════════════════════════════════════════════════════════════╝${C_RESET}\n"
   
   if [ "$show_help" -eq 1 ]; then
@@ -742,10 +952,16 @@ render_terminal_view() {
     printf "${C_BLUE}└─────────────────────────────────────────────────────────────────────────────┘${C_RESET}\n"
   else
     printf "  ${C_BOLD}[SYSTEM TICKER]${C_RESET}\n"
-    if [ "$is_paused" -eq 1 ]; then
+    if [ "$sleep_state" = "PAUSED" ]; then
       printf "  STATUS  : ${C_YELLOW}○ SLEEP NORMAL (Paused)${C_RESET} (Mac will sleep normally)\n"
-    else
+    elif [ "$sleep_state" = "DISABLED" ]; then
       printf "  STATUS  : ${C_GREEN}● SLEEP DISABLED${C_RESET} (Mac stays awake even with lid closed)\n"
+    elif [ "$sleep_state" = "STARTING" ]; then
+      printf "  STATUS  : ${C_YELLOW}○ STARTING${C_RESET} (Waiting for daemon confirmation)\n"
+    elif [ "$sleep_state" = "DEGRADED" ] || [ "$sleep_state" = "UNAVAILABLE" ] || [ "$sleep_state" = "UNKNOWN" ]; then
+      printf "  STATUS  : ${C_RED}○ PROTECTION LOST${C_RESET} (Run: awake doctor)\n"
+    else
+      printf "  STATUS  : ${C_YELLOW}○ SLEEP NORMAL${C_RESET} (Mac may sleep normally)\n"
     fi
 
     local b_label="${C_YELLOW}DISABLED${C_RESET}"
@@ -754,7 +970,7 @@ render_terminal_view() {
     fi
 
     printf "  POWER   : %-30s │ BATT GUARD : %b\n" "$pwr_str" "$b_label"
-    printf "  SESSION : PID %-24s │ DAEMON     : ${C_GREEN}ACTIVE (launchd)${C_RESET}\n" "$$ ($(whoami))"
+    printf "  SESSION : PID %-24s │ DAEMON     : ${C_GREEN}%s${C_RESET}\n" "$$ ($(whoami))" "$daemon_state"
     printf "\n"
     printf "  ${C_BOLD}[COUNTDOWN TICKER]${C_RESET}\n"
     printf "  REMAINING : ${C_CYAN}${C_BOLD}%-24s${C_RESET} TARGET   : %s\n" "$rem_str" "$end_str"
@@ -818,6 +1034,7 @@ run_interactive_terminal() {
   local notice_msg="Sleep prevention ACTIVE. Lid closed is OK. Press [?] for cheat sheet."
   local show_help_modal=0
   local loop_count=0
+  local compact=0
   get_power_info
 
   while true; do
@@ -827,6 +1044,19 @@ run_interactive_terminal() {
 
     if [ $(( loop_count % 5 )) -eq 0 ]; then
       get_power_info
+    fi
+
+    [ "$(terminal_width)" -lt 90 ] && compact=1 || compact=0
+    daemon_health_state "$paused" >/dev/null
+    local sleep_state="NORMAL"
+    case "$DAEMON_HEALTH_STATE" in
+      HEALTHY) sleep_state="DISABLED" ;;
+      PAUSED) sleep_state="PAUSED" ;;
+      STARTING) sleep_state="STARTING" ;;
+      DEGRADED|UNAVAILABLE|UNKNOWN) sleep_state="$DAEMON_HEALTH_STATE" ;;
+    esac
+    if [ "$DAEMON_HEALTH_STATE" = "DEGRADED" ] || [ "$DAEMON_HEALTH_STATE" = "UNAVAILABLE" ] || [ "$DAEMON_HEALTH_STATE" = "UNKNOWN" ]; then
+      notice_msg="Protection lost: daemon is $DAEMON_HEALTH_STATE. Run awake doctor."
     fi
 
     # Battery guard check with user threshold
@@ -851,9 +1081,9 @@ run_interactive_terminal() {
       if [ "$rem_secs" -le 0 ]; then
         notice_msg="Time is up ($initial_label). Restoring normal sleep..."
         printf '\033[H'
-        local pwr_label="⚡ AC Connected (${BATT_PCT}%)"
-        [ "$BATT_SRC" = "Battery Power" ] && pwr_label="🔋 Battery (${BATT_PCT}%)"
-        render_terminal_view "00h 00m 00s" "$end_str" 100 "$elapsed_str" "$pwr_label" "$notice_msg" "$paused" "$show_help_modal" "$batt_guard" "$batt_threshold"
+        local pwr_label="AC Connected (${BATT_PCT}%)"
+        [ "$BATT_SRC" = "Battery Power" ] && pwr_label="Battery (${BATT_PCT}%)"
+        render_terminal_view "00h 00m 00s" "$end_str" 100 "$elapsed_str" "$pwr_label" "$notice_msg" "$paused" "$show_help_modal" "$batt_guard" "$batt_threshold" "$DAEMON_HEALTH_STATE" "$sleep_state" "$compact"
         sleep 1.2
         break
       fi
@@ -865,14 +1095,14 @@ run_interactive_terminal() {
       fi
     fi
 
-    local pwr_display="⚡ AC Connected (${BATT_PCT}%)"
+    local pwr_display="AC Connected (${BATT_PCT}%)"
     if [ "$BATT_SRC" = "Battery Power" ]; then
       local trem="${BATT_TIME:+ ($BATT_TIME)}"
-      pwr_display="🔋 Battery (${BATT_PCT}%$trem)"
+      pwr_display="Battery (${BATT_PCT}%$trem)"
     fi
 
     printf '\033[H'
-    render_terminal_view "$rem_str" "$end_str" "$pct" "$elapsed_str" "$pwr_display" "$notice_msg" "$paused" "$show_help_modal" "$batt_guard" "$batt_threshold"
+    render_terminal_view "$rem_str" "$end_str" "$pct" "$elapsed_str" "$pwr_display" "$notice_msg" "$paused" "$show_help_modal" "$batt_guard" "$batt_threshold" "$DAEMON_HEALTH_STATE" "$sleep_state" "$compact"
 
     local key=""
     read -s -n 1 -t 1 key 2>/dev/null || true
@@ -962,26 +1192,38 @@ run_interactive_terminal() {
             if [ "$batt_guard" -eq 1 ]; then
               batt_guard=0
               BATT_GUARD=0
-              save_config
-              notice_msg="[$(date '+%H:%M:%S')] Battery Safeguard: DISABLED"
+              if save_config; then
+                notice_msg="[$(date '+%H:%M:%S')] Battery Safeguard: DISABLED"
+              else
+                notice_msg="[$(date '+%H:%M:%S')] Battery preference could not be saved"
+              fi
             else
               batt_guard=1
               BATT_GUARD=1
-              save_config
-              notice_msg="[$(date '+%H:%M:%S')] Battery Safeguard: ENABLED (Cutoff: <=${batt_threshold}%)"
+              if save_config; then
+                notice_msg="[$(date '+%H:%M:%S')] Battery Safeguard: ENABLED (Cutoff: <=${batt_threshold}%)"
+              else
+                notice_msg="[$(date '+%H:%M:%S')] Battery preference could not be saved"
+              fi
             fi
           elif [ "$user_b" = "off" ] || [ "$user_b" = "0" ] || [ "$user_b" = "disable" ]; then
             batt_guard=0
             BATT_GUARD=0
-            save_config
-            notice_msg="[$(date '+%H:%M:%S')] Battery Safeguard: DISABLED"
+            if save_config; then
+              notice_msg="[$(date '+%H:%M:%S')] Battery Safeguard: DISABLED"
+            else
+              notice_msg="[$(date '+%H:%M:%S')] Battery preference could not be saved"
+            fi
           elif [[ "$user_b" =~ ^[0-9]+$ ]] && [ "$user_b" -ge 1 ] && [ "$user_b" -le 100 ]; then
             batt_guard=1
             batt_threshold="$user_b"
             BATT_GUARD=1
             BATT_THRESHOLD="$user_b"
-            save_config
-            notice_msg="[$(date '+%H:%M:%S')] Battery Safeguard: ENABLED (Cutoff: <=${batt_threshold}%)"
+            if save_config; then
+              notice_msg="[$(date '+%H:%M:%S')] Battery Safeguard: ENABLED (Cutoff: <=${batt_threshold}%)"
+            else
+              notice_msg="[$(date '+%H:%M:%S')] Battery preference could not be saved"
+            fi
           else
             notice_msg="[$(date '+%H:%M:%S')] Invalid threshold '$user_b'. Enter 1-100 or 'off'."
           fi
@@ -1082,7 +1324,17 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     --off|off)
-      turn_off
+      if [ "${2:-}" = "--all" ]; then
+        shift 2
+        turn_off
+      elif [ -n "${2:-}" ] && [[ "$2" =~ ^[0-9]+$ ]]; then
+        local_off_pid="$2"
+        shift 2
+        turn_off "$local_off_pid"
+      else
+        shift
+        turn_off
+      fi
       exit 0
       ;;
     -b|--battery-guard|--battery)

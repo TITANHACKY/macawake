@@ -19,13 +19,13 @@ Run `awake` without arguments in any terminal (or with `awake -t 2h`) to launch 
 
 ```text
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MACAWAKE TRADING TERMINAL  v1.2.0                     ● LIVE  [LID SAFE]    ║
+║  MACAWAKE TRADING TERMINAL  v1.3.0                     HEALTHY              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
   [SYSTEM TICKER]
   STATUS  : ● SLEEP DISABLED (Mac stays awake even with lid closed)
   POWER   : ⚡ AC Connected (52%, charging)  │ BATT GUARD : ACTIVE (<=30%)
-  SESSION : PID 48291 (TITANHACKY)            │ DAEMON     : ACTIVE (launchd)
+  SESSION : PID 48291 (TITANHACKY)            │ DAEMON     : HEALTHY
 
   [COUNTDOWN TICKER]
   REMAINING : 01h 45m 30s                  TARGET   : 11:30:15
@@ -107,8 +107,11 @@ awake doctor          # Comprehensive health check of LaunchDaemon & permissions
 awake --help          # Full CLI manual & options
 awake --version       # Show version
 
-# Restore normal sleep immediately
-awake --off
+# Stop one session without interrupting other sessions
+awake --off <PID>
+
+# Restore normal sleep for all sessions belonging to this account
+awake --off --all
 ```
 
 ### Time Formats
@@ -122,7 +125,7 @@ Disabling lid-close sleep requires root (`pmset -a disablesleep 1`). On MDM-mana
 
 MacAwake solves this permanently:
 1. **Zero Admin After Install**: The installer creates a lightweight LaunchDaemon (`com.awake.guard`) running as root in the background.
-2. **Unprivileged Multi-Session IPC**: Daily use only creates unprivileged session files in `/Library/Application Support/awake/sessions/`. The root daemon monitors these files and manages `pmset`.
+2. **Unprivileged Multi-Session IPC**: Daily use only creates unprivileged session files in `/Library/Application Support/awake/sessions/<uid>/`. The root daemon monitors the target account's directory and manages `pmset`.
 3. **Anti-Spoofing Security**: The daemon validates that the PID in the request belongs to the user who registered it.
 4. **Crash-Proof Safety Net**: The persistent LaunchDaemon checks every two seconds and is restarted by launchd if terminated:
    - Is the session's owning process still alive? If not &rarr; restore normal sleep.
@@ -139,9 +142,10 @@ MacAwake solves this permanently:
 | `/usr/local/bin/awake` | The `awake` CLI tool |
 | `/usr/local/libexec/awake-guard` | Root background daemon executed by `launchd` |
 | `/Library/LaunchDaemons/com.awake.guard.plist` | LaunchDaemon definition loaded at boot |
-| `/Library/Application Support/awake/sessions/` | Multi-session locks directory |
+| `/Library/Application Support/awake/sessions/<uid>/` | Per-account multi-session locks directory |
+| `/Library/Application Support/awake/requests/<uid>` | Per-account request file |
+| `/Library/Application Support/awake/status/<uid>` | Root-written daemon heartbeat and last `pmset` result |
 | `/Library/Application Support/awake/config` | User preference configuration (battery cutoff, etc.) |
-| `/Library/Application Support/awake/request` | Backward-compatible IPC request file |
 
 ---
 
@@ -157,6 +161,7 @@ $ awake doctor
   [✓] LaunchDaemon service: com.awake.guard is active
   [✓] Guard script: Found and executable at /usr/local/libexec/awake-guard
   [✓] App Support directory: Found at /Library/Application Support/awake
+  [✓] Daemon heartbeat: HEALTHY
   [✓] Request file: Writable by TITANHACKY
   [✓] Sessions directory: Writable by TITANHACKY
   [✓] Config file: Found at /Library/Application Support/awake/config (Battery guard: 30%, enabled: 1)
